@@ -1,4 +1,4 @@
-import { pool } from "@/db";
+import { getPool, hasDatabaseUrl } from "@/db";
 
 // Idempotent schema bootstrap mirroring src/db/schema.ts (same names/defaults as
 // drizzle-kit push), so a fresh database works even before a push has run.
@@ -53,7 +53,10 @@ CREATE TABLE IF NOT EXISTS asset_images (
 const g = globalThis as typeof globalThis & { __stockmetaSchemaReady?: Promise<void> | null };
 
 export function ensureSchema(): Promise<void> {
+  if (!hasDatabaseUrl()) return Promise.resolve();
   if (!g.__stockmetaSchemaReady) {
+    const pool = getPool();
+    if (!pool) return Promise.resolve();
     g.__stockmetaSchemaReady = pool
       .query(DDL)
       .then(() => undefined)
