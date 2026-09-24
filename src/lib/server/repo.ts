@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { asc, eq, getTableColumns, inArray } from "drizzle-orm";
 import { getDb, hasDatabaseUrl } from "@/db";
@@ -13,6 +14,7 @@ import {
   type AppSettingsDTO,
   type AssetDTO,
   type AssetStatus,
+  type StorageInfoDTO,
 } from "@/lib/types";
 
 export type AssetRow = typeof assets.$inferSelect;
@@ -31,21 +33,70 @@ interface LocalStore {
   images: Record<string, { mime: string }>;
 }
 
-const LOCAL_STORE_DIR = path.join(process.cwd(), ".data", "stockmeta");
-const LOCAL_STORE_FILE = path.join(LOCAL_STORE_DIR, "store.json");
-const LOCAL_IMAGES_DIR = path.join(LOCAL_STORE_DIR, "images");
-const LOCAL_THUMB_NAME = "thumb.jpg";
-const LOCAL_ANALYSIS_NAME = "analysis.bin";
 const LOCAL_QUEUE_KEY = "__stockmetaLocalStoreQueue" as const;
+const LOCAL_DIR_KEY = "__stockmetaLocalStoreDir" as const;
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES: AssetStatus[] = ["pending", "processing", "done", "error"];
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const byCreated = <T extends { createdAt: Date; id: string }>(a: T, b: T) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id);
 const nowIso = () => new Date().toISOString();
-const localImageDir = (id: string) => path.join(LOCAL_IMAGES_DIR, id);
-const localThumbPath = (id: string) => path.join(localImageDir(id), LOCAL_THUMB_NAME);
-const localAnalysisPath = (id: string) => path.join(localImageDir(id), LOCAL_ANALYSIS_NAME);
+
+const LOCAL_THUMB_NAME = "thumb.jpg";
+const LOCAL_ANALYSIS_NAME = "analysis.bin";
+
+export interface LocalStorePaths {
+  dir: string;
+  storeFile: string;
+  imagesDir: string;
+  /** True when the preferred directory wasn't writable and we fell back to the OS temp dir. */
+  ephemeral: boolean;
+}
+
+/**
+ * Resolve where the local (no-DATABASE_URL) JSON store lives. The preferred location is
+ * `.data/stockmeta` under the project; when that isn't writable (read-only deploy
+ * filesystems, e.g. serverless), fall back to the OS temp dir so the app still works —
+ * with a warning surfaced through /api/health so users know data is ephemeral.
+ */
+function resolveLocalPaths(): Promise<LocalStorePaths> {
+  const g = globalThis as typeof globalThis & { [LOCAL_DIR_KEY]?: Promise<LocalStorePaths> };
+  if (!g[LOCAL_DIR_KEY]) {
+    g[LOCAL_DIR_KEY] = (async () => {
+      const primary = path.join(process.cwd(), ".data", "stockmeta");
+      try {
+        await mkdir(primary, { recursive: true });
+        const probe = path.join(primary, ".write-test");
+        await writeFile(probe, "ok", "utf8");
+        await rm(probe, { force: true });
+        return { dir: primary, storeFile: path.join(primary, "store.json"), imagesDir: path.join(primary, "images"), ephemeral: false };
+      } catch {
+        const fallback = path.join(os.tmpdir(), "stockmeta");
+        await mkdir(fallback, { recursive: true });
+        return { dir: fallback, storeFile: path.join(fallback, "store.json"), imagesDir: path.join(fallback, "images"), ephemeral: true };
+      }
+    })();
+    g[LOCAL_DIR_KEY].catch(() => undefined);
+  }
+  return g[LOCAL_DIR_KEY];
+}
+
+async function localImageDir(id: string): Promise<string> {
+  return path.join((await resolveLocalPaths()).imagesDir, id);
+}
+async function localThumbPath(id: string): Promise<string> {
+  return path.join(await localImageDir(id), LOCAL_THUMB_NAME);
+}
+async function localAnalysisPath(id: string): Promise<string> {
+  return path.join(await localImageDir(id), LOCAL_ANALYSIS_NAME);
+}
+
+/** Storage status for /api/health and the client banner. */
+export async function getStorageInfo(): Promise<StorageInfoDTO> {
+  if (storageMode() === "postgres") return { mode: "postgres", dir: null, ephemeral: false };
+  const p = await resolveLocalPaths();
+  return { mode: "local", dir: p.dir, ephemeral: p.ephemeral };
+}
 
 export function toAssetDTO(r: AssetListRow): AssetDTO {
   return {
@@ -88,7 +139,7 @@ function normalizeLocalStore(data: unknown): LocalStore {
 
 async function readLocalStore(): Promise<LocalStore> {
   try {
-    const raw = await readFile(LOCAL_STORE_FILE, "utf8");
+    const raw = await readFile((await resolveLocalPaths()).storeFile, "utf8");
     return normalizeLocalStore(JSON.parse(raw));
   } catch (e) {
     const err = e as NodeJS.ErrnoException;
@@ -98,10 +149,11 @@ async function readLocalStore(): Promise<LocalStore> {
 }
 
 async function writeLocalStore(store: LocalStore): Promise<void> {
-  await mkdir(LOCAL_STORE_DIR, { recursive: true });
-  const tmp = `${LOCAL_STORE_FILE}.tmp`;
+  const { dir, storeFile } = await resolveLocalPaths();
+  await mkdir(dir, { recursive: true });
+  const tmp = `${storeFile}.tmp`;
   await writeFile(tmp, `${JSON.stringify(store, null, 2)}\n`, "utf8");
-  await rename(tmp, LOCAL_STORE_FILE);
+  await rename(tmp, storeFile);
 }
 
 async function withLocalLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -288,10 +340,10 @@ export async function createAsset(
   if (storageMode() === "local") {
     return mutateLocalStore(async (store) => {
       const row = buildAssetRow(randomUUID(), data);
-      await mkdir(localImageDir(row.id), { recursive: true });
+      await mkdir(await localImageDir(row.id), { recursive: true });
       await Promise.all([
-        writeFile(localThumbPath(row.id), images.thumb),
-        writeFile(localAnalysisPath(row.id), images.analysis),
+        writeFile(await localThumbPath(row.id), images.thumb),
+        writeFile(await localAnalysisPath(row.id), images.analysis),
       ]);
       store.assets.push(fromAssetRow(row));
       store.images[row.id] = { mime: images.mime || "image/jpeg" };
@@ -342,7 +394,7 @@ export async function deleteAssets(ids: string[] | "all"): Promise<number> {
         const count = store.assets.length;
         store.assets = [];
         store.images = {};
-        await rm(LOCAL_IMAGES_DIR, { recursive: true, force: true });
+        await rm((await resolveLocalPaths()).imagesDir, { recursive: true, force: true });
         return count;
       }
       const valid = ids.filter((id) => UUID_RE.test(id));
@@ -353,7 +405,7 @@ export async function deleteAssets(ids: string[] | "all"): Promise<number> {
       store.assets = store.assets.filter((asset) => !wanted.has(asset.id));
       for (const id of removed) {
         delete store.images[id];
-        await rm(localImageDir(id), { recursive: true, force: true });
+        await rm(await localImageDir(id), { recursive: true, force: true });
       }
       return removed.length;
     });
@@ -378,7 +430,7 @@ export async function getAssetImage(id: string, kind: "thumb" | "analysis"): Pro
     const meta = store.images[id];
     if (!meta) return null;
     try {
-      const data = await readFile(kind === "thumb" ? localThumbPath(id) : localAnalysisPath(id));
+      const data = await readFile(kind === "thumb" ? await localThumbPath(id) : await localAnalysisPath(id));
       return { data, mime: meta.mime || "image/jpeg" };
     } catch (e) {
       const err = e as NodeJS.ErrnoException;

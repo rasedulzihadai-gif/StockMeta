@@ -13,6 +13,7 @@ import {
   type ContentTypeHint,
   type FileTypeDecision,
   type MetadataResult,
+  type ServerInfoDTO,
 } from "@/lib/types";
 import { api, errMsg, runPool } from "@/lib/client/api";
 import { processImage } from "@/lib/client/image";
@@ -21,6 +22,7 @@ import AssetDetail from "./AssetDetail";
 import SettingsModal from "./SettingsModal";
 import ExportModal from "./ExportModal";
 import SelfTestModal from "./SelfTestModal";
+import { ServerWarnings } from "./ServerBanners";
 import { Badge, Button, Segmented, Spinner, cx, type Tone } from "./ui";
 import { IconDownload, IconFlask, IconImage, IconLayers, IconLogo, IconSettings, IconSparkles, IconStop, IconUpload } from "./icons";
 
@@ -40,8 +42,10 @@ const FILTERS: { id: Filter; label: string }[] = [
   { id: "error", label: "Errors" },
 ];
 const VECTOR_RE = /\.(eps|ai|pdf)$/i;
-const RASTER_RE = /\.(jpe?g|png|webp|gif|svg)$/i;
-const FATAL = ["auth", "billing", "config", "not_found"];
+const RASTER_RE = /\.(jpe?g|png|webp|gif|svg|avif|bmp)$/i;
+/** Formats the file picker can offer but the browser canvas can't rasterize. */
+const UNDECODABLE_RE = /\.(heic|heif|hif|tiff?|psd|cr2|cr3|nef|arw|dng|raw)$/i;
+const FATAL = ["auth", "billing", "config", "not_found", "network"];
 const baseName = (n: string) => n.replace(/\.[^.]+$/, "").toLowerCase();
 
 export default function Workspace({ initial }: { initial: InitialData }) {
@@ -58,6 +62,7 @@ export default function Workspace({ initial }: { initial: InitialData }) {
   const [revisions, setRevisions] = useState<Record<string, number>>({});
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [serverInfo, setServerInfo] = useState<ServerInfoDTO | null>(null);
   const stopRef = useRef(false);
   const runningRef = useRef(false);
   const lastCheckRef = useRef<string | null>(null);
@@ -110,6 +115,27 @@ export default function Workspace({ initial }: { initial: InitialData }) {
 
   const selected = useMemo(() => assets.find((a) => a.id === selectedId) ?? null, [assets, selectedId]);
 
+  // Environment diagnostics (storage writability + provider reachability). Explains the
+  // two failure modes that look like "the app is broken": no internet, temporary storage.
+  useEffect(() => {
+    let alive = true;
+    void Promise.all([
+      api<{ ok: boolean; storage: "local" | "postgres"; storageDir?: string | null; ephemeral?: boolean }>("/api/health"),
+      api<{ host: string | null; reachable: boolean | null }>("/api/connectivity"),
+    ])
+      .then(([health, connectivity]) => {
+        if (!alive) return;
+        setServerInfo({
+          storage: { mode: health.storage, dir: health.storageDir ?? null, ephemeral: !!health.ephemeral },
+          connectivity,
+        });
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   useEffect(() => {
     if ((!selectedId || !assets.some((a) => a.id === selectedId)) && assets.length) setSelectedId(assets[0].id);
   }, [assets, selectedId]);
@@ -134,13 +160,36 @@ export default function Workspace({ initial }: { initial: InitialData }) {
       if (!files.length) return;
       const companions = new Map<string, string>();
       for (const f of files) if (VECTOR_RE.test(f.name)) companions.set(baseName(f.name), f.name);
-      const rasters = files.filter((f) => !VECTOR_RE.test(f.name) && (f.type.startsWith("image/") || RASTER_RE.test(f.name)));
+      const rasters: File[] = [];
+      const skipped: { name: string; reason: string }[] = [];
+      for (const f of files) {
+        if (VECTOR_RE.test(f.name)) continue; // vector sources are paired by name, never uploaded directly
+        const looksRaster = f.type.startsWith("image/") || RASTER_RE.test(f.name);
+        const undecodable =
+          UNDECODABLE_RE.test(f.name) || f.type === "image/tiff" || f.type === "image/heic" || f.type === "image/heif";
+        if (!looksRaster) {
+          skipped.push({ name: f.name, reason: "not a supported image (use JPEG, PNG, WebP or SVG)" });
+          continue;
+        }
+        if (undecodable) {
+          skipped.push({
+            name: f.name,
+            reason: /heic|heif|hif/i.test(f.name) || f.type === "image/heic" || f.type === "image/heif"
+              ? "iPhone HEIC photo — convert to JPEG first"
+              : "browsers can't preview this format — export as JPEG or PNG",
+          });
+          continue;
+        }
+        rasters.push(f);
+      }
       const orphans = [...companions.entries()].filter(([b]) => !rasters.some((r) => baseName(r.name) === b)).map(([, n]) => n);
       if (!rasters.length) {
         notify(
-          orphans.length
-            ? "Vector source files (.eps/.ai) can't be previewed in the browser — add the JPEG preview with the same name."
-            : "No supported images found (JPEG, PNG, WebP, SVG).",
+          skipped.length
+            ? `Nothing uploaded. ${skipped[0].name}: ${skipped[0].reason}${skipped.length > 1 ? ` (+${skipped.length - 1} more)` : ""}`
+            : orphans.length
+              ? "Vector source files (.eps/.ai/.pdf) can't be previewed in the browser — add the JPEG/PNG/SVG preview with the same base name."
+              : "No supported images found (JPEG, PNG, WebP, SVG).",
           "error",
         );
         return;
@@ -177,6 +226,14 @@ export default function Workspace({ initial }: { initial: InitialData }) {
         setSelectedId((id) => id ?? created[0].id);
         notify(`Added ${created.length} file(s)${paired ? ` · ${paired} paired with a vector source` : ""}`, "success");
       }
+      if (skipped.length)
+        notify(
+          `Skipped ${skipped.length} file(s): ${skipped
+            .slice(0, 3)
+            .map((s) => `${s.name} (${s.reason})`)
+            .join("; ")}${skipped.length > 3 ? " …" : ""}`,
+          "error",
+        );
       if (orphans.length) notify(`${orphans.length} vector file(s) had no matching preview: ${orphans.slice(0, 3).join(", ")}`, "info");
     },
     [settings.defaultHint, notify],
@@ -457,6 +514,8 @@ export default function Workspace({ initial }: { initial: InitialData }) {
         </div>
       </header>
 
+      {serverInfo && <ServerWarnings info={serverInfo} />}
+
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
         {/* ---------- sidebar ---------- */}
         <aside className="flex h-[46vh] w-full shrink-0 flex-col border-b border-zinc-800/80 lg:h-auto lg:w-[400px] lg:border-b-0 lg:border-r">
@@ -627,6 +686,7 @@ export default function Workspace({ initial }: { initial: InitialData }) {
         onClose={() => setModal(null)}
         providers={providers}
         settings={settings}
+        serverInfo={serverInfo}
         onProvider={(p) => setProviders((prev) => prev.map((x) => (x.id === p.id ? p : x)))}
         onSettings={(patch) => void saveSettings(patch)}
         onOpenSelfTest={() => setModal("selftest")}
