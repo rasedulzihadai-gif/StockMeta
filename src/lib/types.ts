@@ -131,6 +131,26 @@ export interface AppSettingsDTO {
   concurrency: number;
 }
 
+/** Where uploads/keys/API keys are persisted. `ephemeral` = the normal store is not
+ *  writable (e.g. a read-only deploy filesystem) and a temp-dir fallback is in use. */
+export interface StorageInfoDTO {
+  mode: "local" | "postgres";
+  dir: string | null;
+  ephemeral: boolean;
+}
+
+/** Result of a cheap reachability probe to the active provider's base URL.
+ *  `reachable: null` means no probe could be made (no provider configured). */
+export interface ConnectivityDTO {
+  host: string | null;
+  reachable: boolean | null;
+}
+
+export interface ServerInfoDTO {
+  storage: StorageInfoDTO;
+  connectivity: ConnectivityDTO;
+}
+
 export function isHint(v: unknown): v is ContentTypeHint {
   return v === "auto" || v === "single_asset" || v === "template_pack";
 }

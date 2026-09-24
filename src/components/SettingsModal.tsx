@@ -3,9 +3,10 @@
 import { useState } from "react";
 import { WIRE_FORMATS, type ProviderStateDTO, type WireFormat } from "@/lib/providers/registry";
 import { PLATFORM_SPECS } from "@/lib/platforms";
-import { PLATFORM_IDS, type AppSettingsDTO } from "@/lib/types";
+import { PLATFORM_IDS, type AppSettingsDTO, type ServerInfoDTO } from "@/lib/types";
 import { api, errMsg } from "@/lib/client/api";
 import { Badge, Button, Modal, Spinner, Toggle, cx, inputCls } from "./ui";
+import { ServerWarnings } from "./ServerBanners";
 import { IconCheck, IconChevron, IconFlask, IconKey } from "./icons";
 
 interface Props {
@@ -13,12 +14,13 @@ interface Props {
   onClose: () => void;
   providers: ProviderStateDTO[];
   settings: AppSettingsDTO;
+  serverInfo?: ServerInfoDTO | null;
   onProvider: (p: ProviderStateDTO) => void;
   onSettings: (patch: Partial<AppSettingsDTO>) => void;
   onOpenSelfTest: () => void;
 }
 
-export default function SettingsModal({ open, onClose, providers, settings, onProvider, onSettings, onOpenSelfTest }: Props) {
+export default function SettingsModal({ open, onClose, providers, settings, serverInfo, onProvider, onSettings, onOpenSelfTest }: Props) {
   const [expanded, setExpanded] = useState<string | null>(settings.activeProviderId);
   return (
     <Modal
@@ -28,6 +30,7 @@ export default function SettingsModal({ open, onClose, providers, settings, onPr
       title="Settings"
       subtitle="DeepSeek is pre-selected as the primary provider. Every other slot stays available and is configured independently — API keys are stored server-side and never sent back to the browser."
     >
+      {serverInfo && <ServerWarnings info={serverInfo} compact />}
       <section>
         <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Generation</h3>
         <div className="mt-3 grid gap-5 sm:grid-cols-2">

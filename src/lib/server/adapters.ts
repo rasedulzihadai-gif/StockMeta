@@ -30,6 +30,28 @@ type Json = any;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Human explanation for fetch-level failures — users routinely read these as
+ *  "my API key is wrong", so say explicitly what actually happened. */
+function networkErrorMessage(host: string, e: unknown): string {
+  const err = e as Error;
+  const cause = (e as { cause?: { code?: unknown } })?.cause;
+  const code = typeof cause?.code === "string" ? cause.code : "";
+  const reason =
+    code === "ENOTFOUND" || code === "EAI_AGAIN"
+      ? `the server couldn't resolve ${host} (no DNS/internet access)`
+      : code === "ECONNREFUSED"
+        ? `connection refused by ${host} — check the Base URL`
+        : code === "ENETUNREACH" || code === "EHOSTUNREACH"
+          ? `no network route to ${host}`
+          : code || err?.message || String(e);
+  return (
+    `Couldn't reach ${host} — ${reason}. ` +
+    `This is a network problem, NOT an API key problem. ` +
+    `Hosted preview sandboxes usually have no outbound internet: run the app on your own machine ` +
+    `(npm install && npm run dev) or wherever the provider API is reachable.`
+  );
+}
+
 function parseRetryAfter(v: string | null): number | undefined {
   if (!v) return undefined;
   const s = Number(v);
@@ -73,7 +95,7 @@ async function postJson(
     } catch {
       /* keep url */
     }
-    throw new ProviderError("network", `Network error calling ${host}: ${err?.message ?? String(e)}`, { retryable: true });
+    throw new ProviderError("network", networkErrorMessage(host, e), { retryable: true });
   }
   const text = await res.text();
   let data: Json = null;
